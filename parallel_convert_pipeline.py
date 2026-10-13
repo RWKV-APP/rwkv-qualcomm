@@ -84,6 +84,12 @@ MODEL_FILES = {
         "size": "1.5",
         "quant": "a16w8",
     },
+    "1.5B-g1j-w8": {
+        "path": "/mnt/c/Users/halow/Desktop/RWKV-Weights/g1j/20260831-ctx16384-quantized/source/rwkv7-g1j-1.5b-20260831-ctx16384.pth",
+        "encoding": "quant_export/g1j-1b5-w8/rwkv7-g1j-1.5b-20260831-ctx16384.encodings",
+        "size": "1.5",
+        "quant": "a16w8",
+    },
     # "1.5B-w4": {
     #     "path": "/models/rwkv7-g1d-1.5b-20260212-ctx8192.pth",
     #     "encoding": "quant_export/g1d-1b5-w4/rwkv7-g1d-1.5b-20260212-ctx8192.encodings",
@@ -125,6 +131,14 @@ MODEL_FILES = {
     "2.9B-w4-lpbq-b32": {
         "path": "/models/rwkv7-g1h-2.9b-20260710-ctx10240.pth",
         "encoding": "quant_export/g1h-2b9-lpbq-b32-w4/rwkv7-g1h-2.9b-20260710-ctx10240.encodings",
+        "size": "2.9",
+        "quant": "a16w4",
+        "convert_suffix": "a16w4-lpbq-b32",
+        "pack_suffix": "a16w4-lpbq-b32",
+    },
+    "2.9B-g1j-w4-lpbq-b32": {
+        "path": "/mnt/c/Users/halow/Desktop/RWKV-Weights/g1j/20260831-ctx16384-quantized/source/rwkv7-g1j-2.9b-20260831-ctx16384.pth",
+        "encoding": "quant_export/g1j-2b9-lpbq-b32-w4/rwkv7-g1j-2.9b-20260831-ctx16384.encodings",
         "size": "2.9",
         "quant": "a16w4",
         "convert_suffix": "a16w4-lpbq-b32",
@@ -191,9 +205,11 @@ EXTRA_BSZ_CONVERTING = {
     "0.4B": [2, 4, 6, 8, 10, 12, 14, 16],
     "0.4B-translate": [2, 4, 6, 8, 10, 12, 14, 16],
     "1.5B-w8": [2, 4, 6, 8, 10, 12, 14],
+    "1.5B-g1j-w8": [2, 4, 6, 8, 10, 12, 14],
     "1.5B-translate-w8": [2, 4, 6, 8, 10, 12, 14],
     "2.9B-w4": [2, 4, 6, 8],
     "2.9B-w4-lpbq-b32": [2, 4, 6, 8],
+    "2.9B-g1j-w4-lpbq-b32": [2, 4, 6, 8],
 }
 
 # FULL_BSZ_DEVICES = ["8gen3", "8elite", "8sgen3", "8elitegen5", "xelite", "8sgen4"]
@@ -211,9 +227,11 @@ BSZ_GROUPS = [
         "0.4B": [2, 4, 6, 8, 10, 12, 14, 16],
         "0.4B-translate": [2, 4, 6, 8, 10, 12, 14, 16],
         "1.5B-w8": [2, 4, 6, 8, 10, 12, 14],
+        "1.5B-g1j-w8": [2, 4, 6, 8, 10, 12, 14],
         "1.5B-translate-w8": [2, 4, 6, 8, 10, 12, 14],
         "2.9B-w4": [2, 4, 6, 8],
         "2.9B-w4-lpbq-b32": [2, 4, 6, 8],
+        "2.9B-g1j-w4-lpbq-b32": [2, 4, 6, 8],
     },
     {
         "ABC-Music": [2, 4, 6, 8, 10, 12, 14, 16],
@@ -221,9 +239,11 @@ BSZ_GROUPS = [
         "0.4B": [2, 4, 6, 8, 10, 12, 14, 16],
         "0.4B-translate": [2, 4, 6, 8, 10, 12, 14, 16],
         "1.5B-w8": [2, 4, 6, 8],
+        "1.5B-g1j-w8": [2, 4, 6, 8],
         "1.5B-translate-w8": [2, 4, 6, 8],
         "2.9B-w4": [6],
         "2.9B-w4-lpbq-b32": [6],
+        "2.9B-g1j-w4-lpbq-b32": [6],
     },
 ]
 assert len(BSZ_GROUPS) == len(BSZ_SOC_GROUPS)
@@ -908,6 +928,12 @@ def main():
                         help='Filter models to process, comma-separated list (e.g., --filter_model 2.9B-roleplay-w4,1.5B-translate)')
     parser.add_argument('--filter_soc', type=str, default=None,
                         help='Filter SOCs to process, comma-separated list (e.g., --filter_soc 8plusgen1,8gen3)')
+    parser.add_argument('--convert_workers', type=int, default=None,
+                        help='Override the number of parallel convert_model_dlc.py workers')
+    parser.add_argument('--context_workers', type=int, default=None,
+                        help='Override the number of parallel context-binary workers')
+    parser.add_argument('--pack_workers', type=int, default=None,
+                        help='Override the number of parallel pack workers')
     args = parser.parse_args()
 
     # Parse filter_model parameter
@@ -944,7 +970,9 @@ def main():
     if not args.skip_convert:
         convert_commands = build_convert_commands(selected_models=selected_models, selected_socs=selected_socs, no_cleanup=args.no_cleanup)
         random.shuffle(convert_commands)
-        convert_parallel = 1 if selected_models_need_serial_convert(selected_models) else NUM_PARALLEL_CONVERT
+        convert_parallel = args.convert_workers or (1 if selected_models_need_serial_convert(selected_models) else NUM_PARALLEL_CONVERT)
+        if convert_parallel < 1:
+            parser.error('--convert_workers must be at least 1')
         convert_results = run_task_batch(convert_commands, convert_parallel, "convert_model_dlc")
         if has_failed_tasks(convert_results):
             sys.exit(1)
@@ -955,7 +983,10 @@ def main():
     if not args.skip_binary_gen:
         context_commands = build_context_cache_commands(selected_models=selected_models, selected_socs=selected_socs, enable_profiling=args.enable_profiling)
         random.shuffle(context_commands)
-        context_results = run_task_batch(context_commands, NUM_PARALLEL_CONTEXT_BINARY, "make_context_cache_binary_dlc")
+        context_parallel = args.context_workers or NUM_PARALLEL_CONTEXT_BINARY
+        if context_parallel < 1:
+            parser.error('--context_workers must be at least 1')
+        context_results = run_task_batch(context_commands, context_parallel, "make_context_cache_binary_dlc")
         if has_failed_tasks(context_results):
             sys.exit(1)
     else:
@@ -964,7 +995,10 @@ def main():
     # Stage 3: pack_model_file.py (device-specific)
     if not args.skip_pack:
         pack_commands = build_pack_commands(selected_models=selected_models, selected_socs=selected_socs, cleanup=not args.no_cleanup)
-        pack_results = run_task_batch(pack_commands, NUM_PARALLEL_PACK, "pack_model_file")
+        pack_parallel = args.pack_workers or NUM_PARALLEL_PACK
+        if pack_parallel < 1:
+            parser.error('--pack_workers must be at least 1')
+        pack_results = run_task_batch(pack_commands, pack_parallel, "pack_model_file")
         if has_failed_tasks(pack_results):
             sys.exit(1)
     else:
