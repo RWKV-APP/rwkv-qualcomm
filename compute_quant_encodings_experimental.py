@@ -30,6 +30,12 @@ parser.add_argument('--calib_num_batches', type=int, default=10, help='Number of
 parser.add_argument('--seqmse_num_batches', type=int, default=20, help='Number of batches to calibrate on')
 parser.add_argument('--use_cpu', action='store_true', default=False, help='Use cpu to compute')
 parser.add_argument('--load_encodings', type=Path, default=None, help='Path to load encodings from')
+parser.add_argument('--skip_compute_encodings', action='store_true',
+                    help='Skip calibration and reuse all encodings from --load_encodings')
+parser.add_argument('--low_memory_onnx_stage', action='store_true',
+                    help='Save calibrated encodings, release QuantSim, export ONNX graphs, and exit')
+parser.add_argument('--reuse_onnx_models', action='store_true',
+                    help='Reuse existing decode/prefill ONNX graphs and only export encodings')
 parser.add_argument('--w8_embedding', action='store_true', help='Use int8 quantization for embedding')
 parser.add_argument('--w4_head', action='store_true', help='Use int4 quantization for head')
 parser.add_argument('--heads_per_split', type=int, default=8, help='Number of heads per split')
@@ -51,6 +57,8 @@ parser.add_argument('--calib_stream_chunk_size', type=int, default=0,
 parser.add_argument('--no_cleanup', action='store_true',
                     help='Do not delete temporary export files from output_folder')
 args_parser = parser.parse_args()
+if args_parser.skip_compute_encodings and args_parser.load_encodings is None:
+    parser.error('--skip_compute_encodings requires --load_encodings')
 VALID_BLOCKWISE_EXTRA_MODULES = {'att_output', 'lora', 'head'}
 BLOCKWISE_EXTRA_MODULES = {
     item.strip()
@@ -643,6 +651,20 @@ def pass_calibration_data_calib(model: torch.nn.Module, forward_pass_args: Optio
                 break
 
 if args_parser.load_encodings:
+    if args_parser.blockwise_quant:
+        # Recreate the grouped-block quantizers before importing a checkpoint.
+        # AIMET otherwise tries to load LPBQ's per-block encodings into the
+        # default per-channel quantizer shape and fails before export.
+        fn = lambda module: isinstance(module, QuantizedConv2d) and module.param_quantizers['weight'].bitwidth == 4
+        set_grouped_blockwise_quantization_for_weights(
+            sim=sim,
+            arg=fn,
+            bitwidth=4,
+            symmetric=True,
+            decompressed_bw=8,
+            block_size=args_parser.blockwise_block_size,
+            block_grouping=-1,
+        )
     sim.load_encodings(args_parser.load_encodings, allow_overwrite=False)
 elif args_parser.use_w4_adascale:
     sim.model.config = types.SimpleNamespace()
@@ -712,18 +734,21 @@ if torch.cuda.is_available() and not args_parser.use_cpu:
     sim.model.args.fp16 = False
     sim.model.args.bf16 = True
 
-sim.compute_encodings(pass_calibration_data_calib, forward_pass_callback_args=dataloader)
+if not args_parser.skip_compute_encodings:
+    sim.compute_encodings(pass_calibration_data_calib, forward_pass_callback_args=dataloader)
 
-clip_weights_to_7f7f(sim)
+    clip_weights_to_7f7f(sim)
 
-from aimet_torch.v2.experimental import propagate_output_encodings
-import aimet_torch._base.nn.modules.custom as aimet_ops
-propagate_output_encodings(sim, aimet_ops.Concat)
+    from aimet_torch.v2.experimental import propagate_output_encodings
+    import aimet_torch._base.nn.modules.custom as aimet_ops
+    propagate_output_encodings(sim, aimet_ops.Concat)
 
 output_path = './tmp' if args_parser.output_folder is None else str(args_parser.output_folder)
 os.path.exists(output_path) or os.makedirs(output_path)
-if not args_parser.blockwise_quant:
-    # too slow to save encodings for blockwise quant
+if ((not args_parser.blockwise_quant or args_parser.low_memory_onnx_stage)
+        and not args_parser.skip_compute_encodings):
+    # The low-memory path checkpoints blockwise encodings so ONNX graph export
+    # and Qualcomm encoding export can run in separate processes.
     sim.save_encodings_to_json(output_path, 'quant_encodings_checkpoint_calib')
 
 sim.model.to('cpu')
@@ -777,6 +802,34 @@ if args_parser.blockwise_quant:
 
 torch.cuda.empty_cache()
 
+if args_parser.low_memory_onnx_stage:
+    import gc
+
+    module_marker_map = sim._module_marker_map
+    is_conditional = sim._is_conditional
+    del sim
+    gc.collect()
+
+    onnx_utils.OnnxSaver.create_onnx_model_with_pytorch_layer_names(
+        os.path.join(output_path, filename + '.onnx'),
+        model,
+        dummy_input,
+        is_conditional,
+        module_marker_map,
+        {'input_names': input_names, 'output_names': output_names},
+    )
+    onnx_utils.OnnxSaver.create_onnx_model_with_pytorch_layer_names(
+        os.path.join(output_path, prefill_filename + '.onnx'),
+        model,
+        dummy_input_prefill,
+        is_conditional,
+        module_marker_map,
+        {'input_names': input_names_prefill, 'output_names': output_names_prefill},
+    )
+    print('Low-memory ONNX stage complete; rerun with '
+          '--skip_compute_encodings --load_encodings and --reuse_onnx_models')
+    raise SystemExit(0)
+
 # print(sim.model.device)
 os.path.exists(output_path) or os.makedirs(output_path)
 # sim.export(path=output_path, filename_prefix=filename, dummy_input=dummy_input, onnx_export_args={'input_names': input_names, 'output_names': output_names})
@@ -790,13 +843,13 @@ export_fn(sim, output_path, filename, model, sim.model,
           dummy_input, {'input_names': input_names, 'output_names': output_names}, False,
           sim._module_marker_map, sim._is_conditional,
           sim._excluded_layer_names, quantizer_args=sim.quant_args,
-          export_model=True,
+          export_model=not args_parser.reuse_onnx_models,
           filename_prefix_encodings=filename)
 export_fn(sim, output_path, prefill_filename, model, sim.model,
           dummy_input_prefill, {'input_names': input_names_prefill, 'output_names': output_names_prefill}, False,
           sim._module_marker_map, sim._is_conditional,
           sim._excluded_layer_names, quantizer_args=sim.quant_args,
-          export_model=True,
+          export_model=not args_parser.reuse_onnx_models,
           filename_prefix_encodings=prefill_filename)
 
 # set corresponding state_in/out to the same parameters if quantized

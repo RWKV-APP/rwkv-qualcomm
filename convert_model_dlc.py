@@ -61,6 +61,12 @@ parser.add_argument('--save_input_vectors', action='store_true', help='Save inpu
 parser.add_argument('--input_vectors_save_path', type=Path, default="test_vector", help='Path to save input vectors')
 parser.add_argument('--heads_per_split', type=int, default=8, help='Number of heads per split')
 parser.add_argument('--output_name', type=str, default=None, help='Output name for generated files (without extension). If not provided, uses input model filename.')
+parser.add_argument('--chunk_index', type=int, default=None,
+                    help='Only regenerate this 1-based chunk while preserving the full chunk layout')
+parser.add_argument('--resume_existing_dlc', action='store_true',
+                    help='Skip chunks whose expected DLC already exists and is non-empty')
+parser.add_argument('--prune_intermediates_after_chunk', action='store_true',
+                    help='After a chunk DLC succeeds, delete only non-DLC files in that chunk directory')
 parser_args = parser.parse_args()
 
 seq_length = parser_args.prefill_seq_length if parser_args.prefill_model else 1
@@ -84,6 +90,14 @@ model_args.RESCALE_LAYER = 0
 model_args.heads_per_split = parser_args.heads_per_split
 
 model = make_chunks(parser_args.chunks, model_args) if parser_args.chunks > 1 else RWKV_RNN(model_args)
+if parser_args.chunk_index is not None:
+    if parser_args.chunks <= 1:
+        parser.error('--chunk_index requires --chunks greater than 1')
+    if not 1 <= parser_args.chunk_index <= parser_args.chunks:
+        parser.error('--chunk_index must be between 1 and --chunks')
+    chunk_indices = [parser_args.chunk_index - 1]
+else:
+    chunk_indices = list(range(len(model))) if type(model) == list else None
 has_deepemb = model[0].args.has_deepemb if type(model) == list else model.args.has_deepemb
 if has_deepemb:
     deep_emb_size = model[0].deep_emb[0].weight.shape[-1] if type(model) == list else model.deep_emb[0].weight.shape[-1]
@@ -119,6 +133,35 @@ if type(model) == list:
         # Remove extension if present
         if '.' in filename:
             filename = os.path.splitext(filename)[0]
+
+    def get_chunk_artifact_paths(chunk_index):
+        dirname = "onnx/" + filename + f"_chunk{chunk_index+1}of{len(model)}"
+        if parser_args.ext_embedding:
+            dirname += "_embedding"
+        if parser_args.prefill_model:
+            dirname += "_prefill"
+        if parser_args.batch_size > 1:
+            dirname += f"_bsz{parser_args.batch_size}"
+
+        artifact = f"{dirname}/{filename}"
+        if parser_args.ext_embedding:
+            artifact += "_embedding"
+        if parser_args.prefill_model:
+            artifact += "_prefill"
+        if parser_args.batch_size > 1:
+            artifact += "_bsz" + str(parser_args.batch_size)
+        artifact += f"_chunk{chunk_index+1}of{len(model)}"
+        return dirname, artifact + ".onnx", artifact + ".dlc"
+
+    if parser_args.resume_existing_dlc:
+        chunk_indices = [
+            i for i in chunk_indices
+            if not (os.path.isfile(get_chunk_artifact_paths(i)[2])
+                    and os.path.getsize(get_chunk_artifact_paths(i)[2]) > 0)
+        ]
+        print(f"Chunks requiring conversion: {[i + 1 for i in chunk_indices]}")
+        if not chunk_indices:
+            raise SystemExit(0)
     input_dtype = torch.float16 if args.fp16 else torch.float32
 
     if args.EXTERNAL_HEAD:
@@ -167,7 +210,7 @@ if type(model) == list:
             print(f"Embedding quantized and saved to onnx/{filename}_chunk1of{len(model)}.uint16.emb")
 
 
-    for i in range(len(model)):
+    for i in chunk_indices:
         # Add prefill and bsz suffix to dirname to allow parallel execution
         dirname = "onnx/" + filename + f"_chunk{i+1}of{len(model)}"
         if parser_args.ext_embedding:
@@ -320,7 +363,7 @@ if type(model) == list:
             dump_quant_encodings(encodings_chunk, f)
 
     print("Converting and compiling QNN models...")
-    for i in range(len(model)):
+    for i in chunk_indices:
         # Add prefill and bsz suffix to dirname to allow parallel execution
         dirname = "onnx/" + filename + f"_chunk{i+1}of{len(model)}"
         if parser_args.ext_embedding:
@@ -383,6 +426,11 @@ if type(model) == list:
             if result != 0:
                 print(f"Error quantizing QNN dlc model: {quant_cmd}")
                 exit(1)
+        if parser_args.prune_intermediates_after_chunk:
+            for file in os.listdir(dirname):
+                filepath = os.path.join(dirname, file)
+                if os.path.isfile(filepath) and not file.endswith('.dlc'):
+                    os.remove(filepath)
         if not parser_args.no_cleanup:
             for file in os.listdir(dirname):
                 filepath = os.path.join(dirname, file)
