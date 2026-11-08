@@ -1,5 +1,5 @@
 from utils.htp_devices_config import htp_devices, dump_htp_config, dump_htp_link_config
-import argparse, os
+import argparse, os, subprocess
 from pathlib import Path
 
 def main():
@@ -37,8 +37,7 @@ def main():
 
     convert_cmd += " --input_output_tensor_mem_type memhandle"
     # convert_cmd += " --enable_intermediate_outputs"
-    result = os.system(convert_cmd)
-    exit(result)
+    subprocess.run(convert_cmd, shell=True, check=True)
 
 if __name__ == '__main__':
     main()

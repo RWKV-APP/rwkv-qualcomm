@@ -40,7 +40,7 @@
 ## Usage
 ### *This tutorial is obsolete. I will update it soon.*
 ### 1. Convert model weights to QNN model library file.
-- **Note: if you see errors below, just ignore them.**
+- AIMET may print the tracing diagnostic below and recover. Continue only after a successful exit and verification of the expected artifacts. The DLC context wrapper propagates SDK failures.
 ```
 Traceback (most recent call last):
   File "/home/molly/miniconda3/envs/aimet2/lib/python3.10/site-packages/aimet_torch/onnx_utils.py", line 686, in _update_non_leaf_pytorch_modules_onnx_nodes_names
